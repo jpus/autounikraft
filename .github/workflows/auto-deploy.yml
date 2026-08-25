@@ -1,0 +1,360 @@
+# ============================================================================
+# Unikraft Cloud 自动部署工作流
+# ============================================================================
+# 功能: 自动构建镜像并部署到 Unikraft Cloud
+# 
+# 使用前准备:
+#   1. 在 GitHub Settings -> Secrets 中添加 UNIKRAFT_TOKEN
+#   2. 修改下方 org_name 的默认值为你的组织名
+#
+# 使用方式:
+#   Actions -> Deploy to Unikraft Cloud -> Run workflow
+# ============================================================================
+
+name: Deploy to Unikraft Cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ========== 基础配置（必填）==========
+      org_name:
+        description: '组织名称 (Organization)'
+        required: true
+        type: string
+        default: 'my-org'  # 修改为你的组织名
+      
+      instance_name:
+        description: '实例名称 (Instance Name)'
+        required: true
+        type: string
+        default: 'my-instance'
+      
+      metro:
+        description: '部署地区 (Region)'
+        required: true
+        type: choice
+        options:
+          - sin - 新加坡
+          - dal - 美国达拉斯
+          - fra - 德国法兰克福
+          - sfo - 美国旧金山
+          - was - 美国华盛顿特区
+        default: 'sin - 新加坡'
+      
+      memory:
+        description: '内存大小 (Memory)'
+        required: true
+        type: choice
+        options:
+          - 128M
+          - 256M
+          - 512M
+          - 1G
+          - 2G
+        default: '512M'
+      
+      # ========== 镜像配置 ==========
+      image_name:
+        description: '镜像名称 (Image Name)'
+        required: true
+        type: string
+        default: 'my-app'
+      
+      image_tag:
+        description: '镜像标签 (Tag)'
+        required: true
+        type: string
+        default: 'latest'
+      
+      # ========== 存储配置 ==========
+      enable_volume:
+        description: '启用存储卷 (Volume)'
+        required: true
+        type: boolean
+        default: false
+      
+      volume_size:
+        description: '存储卷大小 (Volume Size)'
+        required: false
+        type: choice
+        options:
+          - 128M
+          - 256M
+          - 512M
+          - 1G
+          - 2G
+        default: '512M'
+      
+      # ========== 高级选项 ==========
+      scale_to_zero:
+        description: '自动缩容 (Scale-to-Zero)'
+        required: true
+        type: boolean
+        default: false
+
+# ============================================================================
+# 部署任务
+# ============================================================================
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ========================================
+      # 步骤 1: 准备工作
+      # ========================================
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: ⚙️  Setup Parameters
+        id: params
+        run: |
+          # 提取地区代码（去除中文描述）
+          METRO_CODE=$(echo "${{ inputs.metro }}" | awk '{print $1}')
+          
+          # 自动检测端口（从 Dockerfile 读取 EXPOSE 指令）
+          if [ -f "Dockerfile" ]; then
+            APP_PORT=$(grep -E "^EXPOSE" Dockerfile | head -1 | awk '{print $2}' | sed 's/\/tcp//;s/\/udp//;s/\r//g' | tr -d '[:space:]')
+            
+            if [ -z "$APP_PORT" ]; then
+              echo "❌ 错误: 未在 Dockerfile 中找到 EXPOSE 指令"
+              exit 1
+            fi
+            
+            echo "🔍 检测到应用端口: $APP_PORT"
+          else
+            echo "❌ 错误: 未找到 Dockerfile"
+            exit 1
+          fi
+          
+          # 构建完整的 OCI 格式镜像路径
+          FULL_IMAGE_NAME="oci://unikraft.io/${{ inputs.org_name }}/${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          
+          # 设置环境变量
+          echo "ORG_NAME=${{ inputs.org_name }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ inputs.image_name }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          echo "FULL_IMAGE_NAME=$FULL_IMAGE_NAME" >> $GITHUB_ENV
+          echo "INSTANCE_NAME=${{ inputs.instance_name }}" >> $GITHUB_ENV
+          echo "METRO=$METRO_CODE" >> $GITHUB_ENV
+          echo "PORT=$APP_PORT" >> $GITHUB_ENV
+          echo "MEMORY=${{ inputs.memory }}" >> $GITHUB_ENV
+          echo "SCALE_TO_ZERO=${{ inputs.scale_to_zero }}" >> $GITHUB_ENV
+          echo "ENABLE_VOLUME=${{ inputs.enable_volume }}" >> $GITHUB_ENV
+          echo "VOLUME_SIZE=${{ inputs.volume_size }}" >> $GITHUB_ENV
+          echo "VOLUME_NAME=${{ inputs.instance_name }}-vol" >> $GITHUB_ENV
+          
+          # 显示配置信息
+          echo "======================================"
+          echo "🏢 组织名称: ${{ inputs.org_name }}"
+          echo "📦 镜像信息: $FULL_IMAGE_NAME"
+          echo "🏷️  实例名称: ${{ inputs.instance_name }}"
+          echo "📍 部署地区: ${{ inputs.metro }}"
+          echo "🔌 应用端口: $APP_PORT (自动检测)"
+          echo "💾 实例内存: ${{ inputs.memory }}"
+          echo "⚡ 自动缩容: ${{ inputs.scale_to_zero }}"
+          echo "💿 存储卷: ${{ inputs.enable_volume }} (${{ inputs.volume_size }})"
+          echo "======================================"
+
+      # ========================================
+      # 步骤 2: 安装和配置 Unikraft CLI
+      # ========================================
+      - name: 🔧 Install Unikraft CLI
+        run: |
+          echo "📥 下载并安装 Unikraft CLI..."
+          curl --proto '=https' --tlsv1.2 -fsSL https://unikraft.com/cli/install.sh | sh
+          
+          # 配置 PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          
+          # 验证安装
+          echo ""
+          echo "✅ Unikraft CLI 安装成功"
+          unikraft version
+
+      - name: 🔐 Login to Unikraft Cloud
+        run: |
+          # 检查 Token
+          if [ -z "$UKC_TOKEN" ]; then
+            echo "❌ 错误: 未找到 UNIKRAFT_TOKEN"
+            echo "请在 GitHub Settings -> Secrets 中配置 UNIKRAFT_TOKEN"
+            exit 1
+          fi
+          
+          echo "🔐 使用 Token 登录 Unikraft Cloud..."
+          
+          # 确保 CLI 在 PATH 中
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # 登录
+          echo "${UKC_TOKEN}" | unikraft login --token - --no-browser
+          
+          echo "✅ 登录成功"
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+
+      # ========================================
+      # 步骤 3: 构建镜像
+      # ========================================
+      - name: 🔨 Build and Push Image
+        run: |
+          echo "🔨 开始构建镜像..."
+          
+          # 确保 CLI 在 PATH 中
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # 检查 Kraftfile
+          if [ ! -f "Kraftfile" ]; then
+            echo "❌ 错误: 未找到 Kraftfile"
+            exit 1
+          fi
+          
+          # 构建镜像（使用不带 oci:// 前缀的格式）
+          BUILD_IMAGE_NAME="${{ env.ORG_NAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "📦 构建镜像: $BUILD_IMAGE_NAME"
+          echo "📦 完整格式: ${{ env.FULL_IMAGE_NAME }}"
+          echo ""
+          
+          # 构建并推送
+          echo "🔨 执行构建..."
+          if ! unikraft images build . --output "$BUILD_IMAGE_NAME"; then
+            echo ""
+            echo "❌ 镜像构建失败"
+            echo "请检查 Dockerfile 和 Kraftfile 配置"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✅ 镜像构建完成"
+          echo ""
+          
+          # 等待镜像同步到注册表
+          echo "⏳ 等待镜像同步到注册表 (30秒)..."
+          sleep 30
+          
+          # 验证镜像是否存在
+          echo ""
+          echo "📋 验证镜像..."
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          IMAGE_FOUND=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if unikraft images list | grep -q "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"; then
+              echo "✅ 镜像已确认存在于注册表中"
+              IMAGE_FOUND=true
+              break
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ 镜像尚未出现在列表中，等待 10 秒后重试... ($RETRY_COUNT/$MAX_RETRIES)"
+                sleep 10
+              fi
+            fi
+          done
+          
+          if [ "$IMAGE_FOUND" = false ]; then
+            echo ""
+            echo "⚠️  警告: 镜像未在列表中显示，但将继续尝试部署"
+            echo "📋 当前镜像列表:"
+            unikraft images list || true
+          fi
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+
+      # ========================================
+      # 步骤 4: 创建存储卷（可选）
+      # ========================================
+      - name: 💿 Create Volume
+        if: inputs.enable_volume == true
+        run: |
+          echo "💿 配置存储卷..."
+          
+          # 确保 CLI 在 PATH 中
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # 检查存储卷是否已存在
+          if unikraft volumes list | grep -q "${{ env.VOLUME_NAME }}"; then
+            echo "ℹ️  存储卷 '${{ env.VOLUME_NAME }}' 已存在，跳过创建"
+          else
+            echo "🆕 创建新存储卷..."
+            echo "   名称: ${{ env.VOLUME_NAME }}"
+            echo "   大小: ${{ env.VOLUME_SIZE }}"
+            echo "   地区: ${{ env.METRO }}"
+            echo ""
+            
+            unikraft volumes create \
+              --name ${{ env.VOLUME_NAME }} \
+              --size ${{ env.VOLUME_SIZE }} \
+              --metro ${{ env.METRO }}
+            
+            echo ""
+            echo "✅ 存储卷创建完成"
+          fi
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+
+      # ========================================
+      # 步骤 5: 部署实例
+      # ========================================
+      - name: 🚀 Deploy Instance
+        run: |
+          echo "🚀 开始部署实例..."
+          
+          # 确保 CLI 在 PATH 中
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # 使用完整的 OCI 格式镜像名称
+          echo "📦 使用镜像: ${{ env.FULL_IMAGE_NAME }}"
+          
+          # 构建部署参数
+          DEPLOY_PARAMS="--metro ${{ env.METRO }}"
+          DEPLOY_PARAMS="$DEPLOY_PARAMS --image ${{ env.FULL_IMAGE_NAME }}"
+          DEPLOY_PARAMS="$DEPLOY_PARAMS -n ${{ env.INSTANCE_NAME }}"
+          DEPLOY_PARAMS="$DEPLOY_PARAMS -p 443:${{ env.PORT }}/http+tls"
+          DEPLOY_PARAMS="$DEPLOY_PARAMS -m ${{ env.MEMORY }}iB"
+          DEPLOY_PARAMS="$DEPLOY_PARAMS --autostart"
+          
+          # Scale-to-Zero（可选）
+          if [ "${{ env.SCALE_TO_ZERO }}" = "true" ]; then
+            DEPLOY_PARAMS="$DEPLOY_PARAMS --scale-to-zero policy=on"
+          fi
+          
+          # Volume（可选）
+          if [ "${{ env.ENABLE_VOLUME }}" = "true" ]; then
+            DEPLOY_PARAMS="$DEPLOY_PARAMS -v ${{ env.VOLUME_NAME }}:/data"
+          fi
+          
+          # 执行部署
+          echo "执行命令: unikraft run $DEPLOY_PARAMS"
+          echo ""
+          unikraft run $DEPLOY_PARAMS
+          
+          echo ""
+          echo "✅ 部署完成"
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+
+      # ========================================
+      # 步骤 6: 显示部署信息
+      # ========================================
+      - name: 📊 Get Deployment Info
+        if: success()
+        run: |
+          # 确保 CLI 在 PATH 中
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo ""
+          echo "======================================"
+          echo "✅ 部署成功！"
+          echo "======================================"
+          echo ""
+          echo "📊 当前运行的实例:"
+          echo ""
+          unikraft instance list || true
+          echo ""
+          echo "💡 提示: 访问域名会在实例列表中显示"
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
