@@ -1,0 +1,186 @@
+name: Cleanup Instances
+
+on:
+  workflow_dispatch:
+    inputs:
+      cleanup_mode:
+        description: '清理模式 (Cleanup Mode)'
+        required: true
+        type: choice
+        options:
+          - single - 删除单个实例
+          - all - 删除所有实例
+        default: 'single - 删除单个实例'
+      
+      instance_name:
+        description: '实例名称 (Instance Name) - 仅单个删除时需要'
+        required: false
+        type: string
+        default: ''
+      
+      confirm:
+        description: '确认删除 (输入 DELETE 确认)'
+        required: true
+        type: string
+        default: ''
+
+jobs:
+  cleanup:
+    name: Cleanup Unikraft Instances
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ========================================
+      # 步骤 1: 验证参数
+      # ========================================
+      - name: ✅ Validate Parameters
+        run: |
+          # 验证确认输入
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "❌ 错误: 必须输入 DELETE 来确认删除操作"
+            echo "⚠️  这个操作将删除实例，无法恢复！"
+            exit 1
+          fi
+          
+          # 提取清理模式
+          CLEANUP_MODE=$(echo "${{ inputs.cleanup_mode }}" | awk '{print $1}')
+          echo "CLEANUP_MODE=$CLEANUP_MODE" >> $GITHUB_ENV
+          
+          # 验证单个删除模式下的实例名称
+          if [ "$CLEANUP_MODE" = "single" ]; then
+            if [ -z "${{ inputs.instance_name }}" ]; then
+              echo "❌ 错误: 删除单个实例时必须提供实例名称"
+              exit 1
+            fi
+            echo "🎯 模式: 删除单个实例"
+            echo "📦 实例: ${{ inputs.instance_name }}"
+          else
+            echo "⚠️  模式: 删除所有实例"
+            echo "🚨 警告: 这将删除账号中的所有实例！"
+          fi
+          
+          echo "✅ 参数验证通过"
+
+      # ========================================
+      # 步骤 2: 安装 Unikraft CLI
+      # ========================================
+      - name: 🔧 Install Unikraft CLI
+        run: |
+          echo "📥 下载并安装 Unikraft CLI..."
+          curl --proto '=https' --tlsv1.2 -fsSL https://unikraft.com/cli/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          
+          echo "✅ Unikraft CLI 安装完成"
+
+      # ========================================
+      # 步骤 3: 登录 Unikraft Cloud
+      # ========================================
+      - name: 🔐 Login to Unikraft Cloud
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          if [ -z "$UKC_TOKEN" ]; then
+            echo "❌ 错误: UNIKRAFT_TOKEN Secret 未设置"
+            exit 1
+          fi
+          
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "🔐 登录 Unikraft Cloud..."
+          echo "${UKC_TOKEN}" | unikraft login --token - --no-browser
+          echo "✅ 登录成功"
+
+      # ========================================
+      # 步骤 4: 列出当前实例
+      # ========================================
+      - name: 📋 List Current Instances
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "📋 当前实例列表:"
+          echo ""
+          unikraft instances list 2>/dev/null || echo "没有运行中的实例"
+
+      # ========================================
+      # 步骤 5: 删除实例
+      # ========================================
+      - name: 🗑️ Delete Instance(s)
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          if [ "${{ env.CLEANUP_MODE }}" = "single" ]; then
+            # ===== 删除单个实例 =====
+            echo "🗑️  删除实例: ${{ inputs.instance_name }}"
+            echo ""
+            
+            if unikraft instance delete ${{ inputs.instance_name }} 2>/dev/null; then
+              echo ""
+              echo "✅ 实例 '${{ inputs.instance_name }}' 删除成功"
+            else
+              echo ""
+              echo "❌ 删除失败: 实例 '${{ inputs.instance_name }}' 可能不存在"
+              exit 1
+            fi
+            
+          else
+            # ===== 删除所有实例 =====
+            echo "🗑️  开始删除所有实例..."
+            echo ""
+            
+            # 获取所有实例名称
+            INSTANCES=$(unikraft instances list 2>/dev/null | awk 'NR>1 {print $1}' | grep -v '^$')
+            
+            if [ -z "$INSTANCES" ]; then
+              echo "ℹ️  没有需要删除的实例"
+            else
+              echo "找到以下实例:"
+              echo "$INSTANCES"
+              echo ""
+              
+              # 逐个删除
+              echo "$INSTANCES" | while read instance; do
+                if [ -n "$instance" ]; then
+                  echo "删除: $instance"
+                  unikraft instance delete "$instance" 2>/dev/null || echo "  ⚠️  删除失败"
+                fi
+              done
+              
+              echo ""
+              echo "✅ 所有实例已处理"
+            fi
+          fi
+
+      # ========================================
+      # 步骤 6: 验证清理结果
+      # ========================================
+      - name: 🔍 Verify Cleanup Result
+        if: always()
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "🔍 验证清理结果:"
+          echo ""
+          
+          if [ "${{ env.CLEANUP_MODE }}" = "single" ]; then
+            # 验证单个实例是否已删除
+            if unikraft instances list 2>/dev/null | grep -q "${{ inputs.instance_name }}"; then
+              echo "⚠️  实例 '${{ inputs.instance_name }}' 仍然存在"
+            else
+              echo "✅ 确认: 实例 '${{ inputs.instance_name }}' 已删除"
+            fi
+          else
+            # 验证所有实例
+            REMAINING=$(unikraft instances list 2>/dev/null | awk 'NR>1 {print $1}' | grep -v '^$' | wc -l)
+            if [ "$REMAINING" -eq 0 ]; then
+              echo "✅ 确认: 没有运行中的实例"
+            else
+              echo "⚠️  仍有 $REMAINING 个实例在运行"
+              unikraft instances list 2>/dev/null || true
+            fi
+          fi
