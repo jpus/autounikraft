@@ -1,0 +1,193 @@
+# ============================================================================
+# Unikraft Cloud 镜像清理工作流
+# ============================================================================
+# 功能: 清理 unikraft.io 上存储的历史镜像，释放存储空间
+# 
+# 使用方式:
+#   Actions -> Cleanup Unikraft Images -> Run workflow
+# ============================================================================
+
+name: Cleanup Unikraft Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      cleanup_mode:
+        description: '清理模式 (Cleanup Mode)'
+        required: true
+        type: choice
+        options:
+          - single - 删除单个镜像
+          - all - 删除所有镜像
+        default: 'single - 删除单个镜像'
+      
+      image_name:
+        description: '镜像名称/Tag (如: jpus/node3new:latest) - 仅单个删除时需要'
+        required: false
+        type: string
+        default: ''
+      
+      confirm:
+        description: '确认删除 (输入 DELETE 确认)'
+        required: true
+        type: string
+        default: ''
+
+jobs:
+  cleanup:
+    name: Cleanup Unikraft Images
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ========================================
+      # 步骤 1: 验证参数
+      # ========================================
+      - name: ✅ Validate Parameters
+        run: |
+          # 验证确认输入
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "❌ 错误: 必须输入 DELETE 来确认删除操作"
+            echo "⚠️  这个操作将从云端删除镜像，无法恢复！"
+            exit 1
+          fi
+          
+          # 提取清理模式
+          CLEANUP_MODE=$(echo "${{ inputs.cleanup_mode }}" | awk '{print $1}')
+          echo "CLEANUP_MODE=$CLEANUP_MODE" >> $GITHUB_ENV
+          
+          # 验证单个删除模式下的镜像名称
+          if [ "$CLEANUP_MODE" = "single" ]; then
+            if [ -z "${{ inputs.image_name }}" ]; then
+              echo "❌ 错误: 删除单个镜像时必须提供镜像名称/Tag"
+              exit 1
+            fi
+            echo "🎯 模式: 删除单个镜像"
+            echo "📦 镜像: ${{ inputs.image_name }}"
+          else
+            echo "⚠️  模式: 删除所有镜像"
+            echo "🚨 警告: 这将删除账号中的所有镜像并释放所有存储空间！"
+          fi
+          
+          echo "✅ 参数验证通过"
+
+      # ========================================
+      # 步骤 2: 安装 Unikraft CLI
+      # ========================================
+      - name: 🔧 Install Unikraft CLI
+        run: |
+          echo "📥 下载并安装 Unikraft CLI..."
+          curl --proto '=https' --tlsv1.2 -fsSL https://unikraft.com/cli/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          
+          echo "✅ Unikraft CLI 安装完成"
+
+      # ========================================
+      # 步骤 3: 登录 Unikraft Cloud
+      # ========================================
+      - name: 🔐 Login to Unikraft Cloud
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          if [ -z "$UKC_TOKEN" ]; then
+            echo "❌ 错误: UNIKRAFT_TOKEN Secret 未设置"
+            exit 1
+          fi
+          
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "🔐 登录 Unikraft Cloud..."
+          echo "${UKC_TOKEN}" | unikraft login --token - --no-browser
+          echo "✅ 登录成功"
+
+      # ========================================
+      # 步骤 4: 列出当前镜像
+      # ========================================
+      - name: 📋 List Current Images
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "📋 当前云端镜像列表:"
+          echo ""
+          unikraft images list 2>/dev/null || echo "没有存储的镜像"
+
+      # ========================================
+      # 步骤 5: 删除镜像
+      # ========================================
+      - name: 🗑️ Delete Image(s)
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          if [ "${{ env.CLEANUP_MODE }}" = "single" ]; then
+            # ===== 删除单个镜像 =====
+            echo "🗑️  删除镜像: ${{ inputs.image_name }}"
+            echo ""
+            
+            if unikraft image remove ${{ inputs.image_name }} 2>/dev/null || unikraft image rm ${{ inputs.image_name }} 2>/dev/null; then
+              echo ""
+              echo "✅ 镜像 '${{ inputs.image_name }}' 删除成功"
+            else
+              echo ""
+              echo "❌ 删除失败: 镜像 '${{ inputs.image_name }}' 可能不存在或格式不正确"
+              exit 1
+            fi
+            
+          else
+            # ===== 删除所有镜像 =====
+            echo "🗑️  开始删除所有镜像..."
+            echo ""
+            
+            # 获取所有镜像名称/Digest
+            IMAGES=$(unikraft images list 2>/dev/null | awk 'NR>1 {print $1}' | grep -v '^$')
+            
+            if [ -z "$IMAGES" ]; then
+              echo "ℹ️  没有需要删除的镜像"
+            else
+              echo "找到以下镜像:"
+              echo "$IMAGES"
+              echo ""
+              
+              # 逐个删除
+              echo "$IMAGES" | while read img; do
+                if [ -n "$img" ]; then
+                  echo "删除镜像: $img"
+                  unikraft image remove "$img" 2>/dev/null || unikraft image rm "$img" 2>/dev/null || echo "  ⚠️  删除失败"
+                fi
+              done
+              
+              echo ""
+              echo "✅ 所有镜像清理处理完毕"
+            fi
+          fi
+
+      # ========================================
+      # 步骤 6: 验证清理结果
+      # ========================================
+      - name: 🔍 Verify Cleanup Result
+        if: always()
+        env:
+          UKC_TOKEN: ${{ secrets.UNIKRAFT_TOKEN }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "🔍 验证清理结果:"
+          echo ""
+          
+          if [ "${{ env.CLEANUP_MODE }}" = "single" ]; then
+            if unikraft images list 2>/dev/null | grep -q "${{ inputs.image_name }}"; then
+              echo "⚠️  镜像 '${{ inputs.image_name }}' 仍存在"
+            else
+              echo "✅ 确认: 镜像 '${{ inputs.image_name }}' 已成功从云端移除"
+            fi
+          else
+            REMAINING=$(unikraft images list 2>/dev/null | awk 'NR>1 {print $1}' | grep -v '^$' | wc -l)
+            if [ "$REMAINING" -eq 0 ]; then
+              echo "✅ 确认: 云端已清空，没有剩余镜像"
+            else
+              echo "⚠️  仍有 $REMAINING 个镜像未被清除"
+              unikraft images list 2>/dev/null || true
+            fi
+          fi
