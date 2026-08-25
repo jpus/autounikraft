@@ -1,18 +1,13 @@
 FROM node:20-alpine
 
-# 安装必要的系统工具
-RUN apk update && \
-    apk add --no-cache \
-        curl \
-        openssl \
-        ca-certificates && \
-    rm -rf /var/cache/apk/*
-
 WORKDIR /app
 
-# 复制并安装依赖
+# 安装必要的系统工具并立即清理 apk 缓存
+RUN apk add --no-cache curl openssl ca-certificates
+
+# 复制依赖配置并只安装生产依赖，安装后清除 npm 缓存
 COPY package.json .
-RUN npm install --omit=dev
+RUN npm install --omit=dev && npm cache clean --force
 
 # 复制应用代码
 COPY index.js index.html .
